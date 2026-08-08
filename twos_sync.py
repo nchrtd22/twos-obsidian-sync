@@ -49,42 +49,39 @@ FN_MAX = 60
 BAD_FN = re.compile(r'[/\\?%*:|"<>\x00-\x1f#]')
 
 # Will be configured by setup_logging()
-_logger = None
+_logger = logging.getLogger("twos_sync")
 
 
 # ------------------------------------------------------------- small helpers
 
 def log(msg, level=logging.INFO):
     """Write to both stdout and the file logger."""
-    if _logger:
-        _logger.log(level, msg)
-    else:
-        print(msg, flush=True)
+    _logger.log(level, msg)
 
 
 def setup_logging(log_path, verbose=False):
     """Configure dual-output logging: stdout + rotating file."""
-    global _logger
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("twos_sync")
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    logger.handlers.clear()
+    _logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    _logger.handlers.clear()
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 
     fh = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
     fh.setLevel(logging.DEBUG if verbose else logging.INFO)
     fh.setFormatter(fmt)
-    logger.addHandler(fh)
+    _logger.addHandler(fh)
 
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(logging.DEBUG if verbose else logging.INFO)
     sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    _logger.addHandler(sh)
 
-    _logger = logger
-    return logger
+    # Suppress lastResort handler so errors don't double-print
+    _logger.propagate = False
+
+    return _logger
 
 
 def parse_iso(s):
@@ -95,11 +92,11 @@ def parse_iso(s):
 
 
 def local_date(dt):
-    return dt.astimezone().strftime("%Y-%m-%d")
+    return dt.astimezone().strftime("%Y-%m-%d") if dt else ""
 
 
 def local_time(dt):
-    return dt.astimezone().strftime("%H:%M")
+    return dt.astimezone().strftime("%H:%M") if dt else ""
 
 
 def sanitize_filename(text, fallback):
@@ -116,17 +113,15 @@ def sanitize_filename(text, fallback):
     return t or fallback
 
 
-def load_env_file(path):
-    out = {}
+def load_env_key(path, key_name):
+    """Read a single KEY=value from an env-style file. Returns None if absent."""
     if not path.exists():
-        return out
+        return None
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        out[k.strip()] = v.strip().strip('"').strip("'")
-    return out
+        if line.startswith(f"{key_name}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
 
 
 # ----------------------------------------------------------------- API client
@@ -174,26 +169,23 @@ class Twos:
                 raise
         raise RuntimeError("repeatedly rate-limited; aborting")
 
-    def lists_all(self):
+    def _paged(self, path, key, **params):
+        """Generic paginated fetch. Yields items from `key` until has_more is false."""
         out, page = [], 0
         while page < MAX_PAGES:
-            d = self._get("/lists", {"page": page})
-            out.extend(d.get("lists", []))
+            d = self._get(path, {**params, "page": str(page)})
+            out.extend(d.get(key, []))
             if not d.get("has_more"):
                 break
             page += 1
         return out
 
+    def lists_all(self):
+        return self._paged("/lists", "lists")
+
     def things(self, **params):
         """Page through GET /things with optional since/sort/list_id/etc."""
-        out, page = [], 0
-        while page < MAX_PAGES:
-            d = self._get("/things", {**params, "page": str(page)})
-            out.extend(d.get("things", []))
-            if not d.get("has_more"):
-                break
-            page += 1
-        return out
+        return self._paged("/things", "things", **params)
 
     def today(self, date_str):
         d = self._get("/today", {"date": date_str})
@@ -267,6 +259,14 @@ def map_tags(tags, cfg):
 
 # --------------------------------------------------------------- file writers
 
+def _quote(value):
+    """Quote a YAML scalar if it needs quoting."""
+    s = str(value)
+    if s.startswith("[[") or ":" in s or "#" in s or '"' in s:
+        return f'"{s}"'
+    return s
+
+
 def frontmatter(props):
     """Serialize an ordered dict of props to a YAML frontmatter block."""
     lines = ["---"]
@@ -278,22 +278,29 @@ def frontmatter(props):
         elif isinstance(v, list):
             lines.append(f"{k}:")
             for item in v:
-                if isinstance(item, str) and (item.startswith("[[") or ":" in item or "#" in item):
-                    lines.append(f'  - "{item}"')
-                else:
-                    lines.append(f"  - {item}")
+                lines.append(f"  - {_quote(item)}")
         else:
-            s = str(v)
-            if s.startswith("[[") or ":" in s or "#" in s or '"' in s:
-                lines.append(f'{k}: "{s}"')
-            else:
-                lines.append(f"{k}: {s}")
+            lines.append(f"{k}: {_quote(v)}")
     lines.append("---")
     return "\n".join(lines) + "\n"
 
 
+def _aggregate_tags(things, cfg):
+    """Map all tags across a list of things, aggregating categories and tags."""
+    cats, tags = [], set()
+    for t in things:
+        c, tg = map_tags(t.get("tags"), cfg)
+        for c2 in c:
+            if c2 not in cats:
+                cats.append(c2)
+        tags.update(tg)
+    if not cats:
+        cats = [cfg["default_cat"]]
+    return cats, tags
+
+
 def render_clipping(t, lists, cfg):
-    cats, tags = map_tags(t.get("tags"), cfg)
+    cats, tags = _aggregate_tags([t], cfg)
     text = (t.get("text") or "").strip()
     url = (t.get("url") or "").strip()
     title = text or url
@@ -321,15 +328,7 @@ def render_clipping(t, lists, cfg):
 def render_list_note(title, things, list_created, cfg):
     """Compound note for a permanent list. Renders ALL thing kinds (option c):
     todos as checkboxes, URLs as links, plain notes as bullets."""
-    cats, tags = [], set()
-    for t in things:
-        c, tg = map_tags(t.get("tags"), cfg)
-        for c2 in c:
-            if c2 not in cats:
-                cats.append(c2)
-        tags.update(tg)
-    if not cats:
-        cats = [cfg["default_cat"]]
+    cats, tags = _aggregate_tags(things, cfg)
     props = {
         "created": local_date(parse_iso(list_created)) if list_created else None,
         "type": "twos-list",
@@ -485,8 +484,7 @@ def run(args):
     if key:
         log(f"Using TWOS_API_KEY from environment.")
     else:
-        env = load_env_file(ENV_PATH)
-        key = env.get("TWOS_API_KEY")
+        key = load_env_key(ENV_PATH, "TWOS_API_KEY")
         if key:
             log(f"Using TWOS_API_KEY from {ENV_PATH}")
     if not key:
@@ -532,30 +530,27 @@ def run(args):
             _save_state(state)
         return
 
-    # Lazy-list resolution cache (unknown/archived lists) + restore from state
-    extra_lists = dict(state.get("lists") or {})
-    unresolved_lists = []   # list_ids that 404'd (-> "Deleted list" stubs)
-
-    def resolve_list(lid):
-        """Return List dict for lid (from maps, extra_lists, or GET /lists/{id}).
-        Caches positive AND negative results. Returns a synthetic stub for
-        null/empty ids and 404s so things are still imported, not skipped."""
-        if not lid:
-            # Orphaned things (no list) -> bucket into a synthetic "Unlisted" list
-            stub = {"id": "", "title": "Unlisted", "today": False, "archived": False}
-            return stub
-        if lid in lists:
-            return lists[lid]
-        if lid in extra_lists:
-            return extra_lists[lid]
-        li = tw.list(lid)
-        if li is None:
-            # 404 / unresolvable -> synthetic stub so things still import
-            li = {"id": lid, "title": "Deleted list", "today": False, "archived": True}
-            unresolved_lists.append(lid)
-        extra_lists[lid] = li
-        lists[lid] = li
-        return li
+def resolve_list(lid, lists, extra_lists, tw, unresolved_lists):
+    """Return List dict for lid (from maps, extra_lists, or GET /lists/{id}).
+    Caches positive AND negative results. Returns a synthetic stub for
+    null/empty ids and 404s so things are still imported, not skipped."""
+    if not lid:
+        # Orphaned things (no list) -> bucket into a synthetic "Unlisted" list
+        if "unlisted" not in extra_lists:
+            extra_lists["unlisted"] = {"id": "", "title": "Unlisted", "today": False, "archived": False}
+        return extra_lists["unlisted"]
+    if lid in lists:
+        return lists[lid]
+    if lid in extra_lists:
+        return extra_lists[lid]
+    li = tw.list(lid)
+    if li is None:
+        # 404 / unresolvable -> synthetic stub so things still import
+        li = {"id": lid, "title": "Deleted list", "today": False, "archived": True}
+        unresolved_lists.append(lid)
+    extra_lists[lid] = li
+    lists[lid] = li
+    return li
 
     # Bucket — also pre-group for O(1) lookups in full mode
     daily_dates = {}        # date_str -> list of things
@@ -566,7 +561,7 @@ def run(args):
 
     for t in things:
         lid = t.get("list_id")
-        li = resolve_list(lid)
+        li = resolve_list(lid, lists, extra_lists, tw, unresolved_lists)
         for tg in t.get("tags") or []:
             n = (tg or "").strip().lstrip("#").strip().lower()
             if n and not n.isdigit() and n not in cfg["drop"] and n not in cfg["cat_map"]:
@@ -672,8 +667,7 @@ def run(args):
         new_cursor = max((t.get("updated") or t.get("created") or "") for t in things) if things else state.get("cursor")
 
     # ---- Report ----
-    log("")
-    log(f"Twos sync {'(DRY-RUN)' if args.dry_run else '(APPLIED)'}")
+    log(f"\nTwos sync {'(DRY-RUN)' if args.dry_run else '(APPLIED)'}")
     log(f"  Things processed: {len(things)}  ({tw._n} API calls)")
     log(f"  Atomic clippings (-> {IMPORT_DIR}/): {n_new + n_upd} ({n_new} new, {n_upd} upd)")
     log(f"  Tasks grouped into list notes: {tasks_grouped}")
@@ -686,7 +680,7 @@ def run(args):
     if unresolved_lists:
         log(f"  Deleted/unresolvable lists (things imported as 'Deleted list'): {len(unresolved_lists)}", logging.WARNING)
     if unmapped_tags:
-        log(f"  Unmapped tags (consider adding to {CFG_YAML}): "
+        log(f"  Unmapped tags (consider adding to {config_path}): "
             f"{', '.join(sorted(unmapped_tags)[:20])}"
             + (f"  (+{len(unmapped_tags) - 20} more)" if len(unmapped_tags) > 20 else ""),
             logging.WARNING)
@@ -715,7 +709,7 @@ def _save_state(state):
 # --------------------------------------------------------------- self-test
 
 def self_test():
-    log("Running self-test...")
+    print("Running self-test...")
 
     # parse_iso / local
     dt = parse_iso("2026-08-01T14:49:00.000Z")
@@ -777,15 +771,14 @@ def self_test():
         {"type": "note", "text": "Check this", "url": "https://obsidian.md", "created": "2026-01-03T08:00:00Z"},
         {"type": "note", "text": "Plain text", "created": "2026-01-04T08:00:00Z"},
     ]
-    cfg2 = {"cat_map": {"study": "[[Studies]]"}, "drop": [], "default_cat": "[[Inbox]]"}
-    note = render_list_note("Project A", list_things, "2026-01-01T00:00:00Z", cfg2)
+    note = render_list_note("Project A", list_things, "2026-01-01T00:00:00Z", cfg)
     assert "- [ ] Read articles" in note, "list: open task"
     assert "- [x] Send ticket" in note, "list: done task"
     assert "[Check this](https://obsidian.md)" in note, "list: url link"
     assert "- Plain text" in note, "list: plain bullet"
     assert "[[Studies]]" in note, "list: category from tags"
 
-    log("Self-test PASSED.")
+    print("Self-test PASSED.")
     return 0
 
 
@@ -798,11 +791,13 @@ def main():
     ap.add_argument("--config", metavar="PATH", help=f"Tag map YAML (default: {DEFAULT_CONFIG_PATH}).")
     ap.add_argument("--log-file", metavar="PATH", help=f"Log file (default: {DEFAULT_LOG_PATH}).")
     ap.add_argument("--verbose", action="store_true", help="Log per-note-write details.")
+    ap.add_argument("--version", action="version", version="%(prog)s 1.0.0")
     ap.add_argument("--self-test", action="store_true", help="Run built-in tests and exit.")
     args = ap.parse_args()
 
     if args.self_test:
-        sys.exit(self_test())
+        self_test()
+        sys.exit(0)
     try:
         run(args)
     except KeyboardInterrupt:
