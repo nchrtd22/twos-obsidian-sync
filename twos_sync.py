@@ -6,14 +6,16 @@ Writes notes with the vault frontmatter schema (created/categories/type/origin).
 Atomic notes (clippings, tasks) are updated in place via twos_id.
 Compound notes (daily `## Twos` sections, per-list notes) are regenerated.
 
-API key:  env TWOS_API_KEY  or  ~/.config/twos-sync/.env
-State:    ~/.local/share/twos-sync/state.json  (cursor + twos_id->path map)
-Config:   <vault>/twos-import-map.yaml  (or .json)
+API key:  env TWOS_API_KEY  or  $XDG_CONFIG_HOME/twos-sync/.env
+State:    $XDG_DATA_HOME/twos-sync/state.json
+Config:   $XDG_CONFIG_HOME/twos-sync/twos-import-map.yaml (--config to override)
+Log:      $XDG_DATA_HOME/twos-sync/twos-sync.log (--log-file to override)
 
 Usage:
-  python3 twos_sync.py [--dry-run] [--full] [--list ID] [--vault PATH] [--self-test]
+  python3 twos_sync.py [--vault PATH] [--dry-run] [--full] [--list ID]
+                       [--config PATH] [--log-file PATH] [--verbose] [--self-test]
 
-See twos-sync-README.md for setup.
+See README.md for setup.
 """
 
 import argparse
@@ -31,15 +33,15 @@ from urllib import request as urlreq
 from urllib.error import HTTPError, URLError
 
 API_BASE = "https://writethingsdown.com/api/v1"
-CFG_YAML = "twos-import-map.yaml"
-CFG_JSON = "twos-import-map.json"
-ENV_PATH = Path("~/.config/twos-sync/.env").expanduser()
-STATE_PATH = Path("~/.local/share/twos-sync/state.json").expanduser()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "twos-sync"
+STATE_DIR = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser() / "twos-sync"
+ENV_PATH = CONFIG_DIR / ".env"
+STATE_PATH = STATE_DIR / "state.json"
+DEFAULT_LOG_PATH = STATE_DIR / "twos-sync.log"
+DEFAULT_CONFIG_PATH = CONFIG_DIR / "twos-import-map.yaml"
 SECTION_HEADER = "## Twos"
 DAILY_DIR = "Daily"
 IMPORT_DIR = "Things"     # non-daily Twos imports land here (staging)
-LOG_DIR = "_logs"
-LOG_FILE = "twos-sync.log"
 MAX_PAGES = 400
 REQ_DELAY = 0.12           # seconds between API calls (limit ~17/min, we use ~8/min)
 FN_MAX = 60
@@ -60,27 +62,25 @@ def log(msg, level=logging.INFO):
         print(msg, flush=True)
 
 
-def setup_logging(vault, verbose=False):
-    """Configure dual-output logging: stdout (plain) + rotating file (markdown-formatted)."""
+def setup_logging(log_path, verbose=False):
+    """Configure dual-output logging: stdout + rotating file."""
     global _logger
-    log_dir = vault / LOG_DIR
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / LOG_FILE
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("twos_sync")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.handlers.clear()
 
-    # File handler: rotating, markdown-formatted lines
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+
     fh = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
     fh.setLevel(logging.DEBUG if verbose else logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Stdout handler: same format for interactive runs
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(logging.DEBUG if verbose else logging.INFO)
-    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+    sh.setFormatter(fmt)
     logger.addHandler(sh)
 
     _logger = logger
@@ -212,39 +212,29 @@ class Twos:
 
 DEFAULT_CFG = {
     "categories": {
-        "master, mbas511, mbas512, mbas514, mbas515, mbas516, ola, pensum, obligatorisk, studier, pedagogikk, bok, bokkapittel, e-bok, smartnotes, feynman, notebooklm, artikkel, barnehageforskningskonferansen2026": "[[Studies]]",
-        "veslefrikk, skreddern, jobb, barnehage, avdelingsplan, hms, mote, mykid, skole, spes.ped, dugnad": "[[Work]]",
-        "reise": "[[Travel]]",
-        "fotball, cpfc, cpsn": "[[Football]]",
-        "familie, ane, jonas, markus, helse, hjemmet, mat, kler, telefon, ol, mal, ide, forslag, tips, sitat": "[[Personal]]",
-        "okonomi, okonomi, bank, abonnement": "[[Finance]]",
-        "linux, git, terminal, obsidian, ai, chatgpt, prompt, midjourney, android, cli, vpn, privacy, security, koreader, kobo, streaming": "[[Tech]]",
-        "musikk, post-rock, tonsofrock": "[[Music]]",
+        "work, project, task": "[[Work]]",
+        "travel, trip": "[[Travel]]",
+        "tech, code, linux": "[[Tech]]",
+        "personal, home, family": "[[Personal]]",
+        "study, reading, book": "[[Studies]]",
     },
-    "drop": ["chrome", "firefox", "email", "facebook", "doi", "twos",
-             "agenda", "gjoremal", "detaljer", "viktig", "halvarlig", "arlig", "manedlig",
-             "orden", "rydde", "vedlikehold", "karriere", "rom", "kontakt"],
+    "drop": ["chrome", "firefox", "email", "twos"],
     "default_category": "[[Inbox]]",
 }
 
 
-def load_config(vault):
-    yml = vault / CFG_YAML
-    jsn = vault / CFG_JSON
-    raw = None
-    if yml.exists():
+def load_config(config_path):
+    if config_path.exists():
         try:
             import yaml
         except ImportError:
-            log(f"NOTE: PyYAML missing and {CFG_YAML} present. "
+            log(f"NOTE: PyYAML missing and {config_path} present. "
                 f"Install with: pip install --user pyyaml  (or uv run --with pyyaml)")
-            log(f"Falling back to built-in defaults.")
+            log("Falling back to built-in defaults.")
         else:
-            raw = yaml.safe_load(yml.read_text(encoding="utf-8")) or {}
-    if raw is None and jsn.exists():
-        raw = json.loads(jsn.read_text(encoding="utf-8"))
-    if raw is None:
-        log(f"NOTE: no {CFG_YAML} found; using built-in defaults.")
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    else:
+        log(f"NOTE: no config at {config_path}; using built-in defaults.")
         raw = DEFAULT_CFG
 
     cat_map = {}
@@ -482,10 +472,13 @@ def run(args):
     if not vault.exists():
         sys.exit(f"vault not found: {vault}")
 
-    setup_logging(vault, verbose=args.verbose)
+    config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+    log_path = Path(args.log_file) if args.log_file else DEFAULT_LOG_PATH
+
+    setup_logging(log_path, verbose=args.verbose)
     log(f"## Sync started ({'dry-run' if args.dry_run else 'live'}, mode={'full' if args.full else 'delta'})")
 
-    cfg = load_config(vault)
+    cfg = load_config(config_path)
 
     # API key
     key = os.environ.get("TWOS_API_KEY")
@@ -802,6 +795,8 @@ def main():
     ap.add_argument("--full", action="store_true", help="Ignore cursor; fetch everything.")
     ap.add_argument("--list", metavar="ID", help="Restrict to one list id (rebuild only that).")
     ap.add_argument("--vault", metavar="PATH", help="Vault root (default: script's parent).")
+    ap.add_argument("--config", metavar="PATH", help=f"Tag map YAML (default: {DEFAULT_CONFIG_PATH}).")
+    ap.add_argument("--log-file", metavar="PATH", help=f"Log file (default: {DEFAULT_LOG_PATH}).")
     ap.add_argument("--verbose", action="store_true", help="Log per-note-write details.")
     ap.add_argument("--self-test", action="store_true", help="Run built-in tests and exit.")
     args = ap.parse_args()
