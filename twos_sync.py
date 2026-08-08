@@ -19,6 +19,7 @@ See twos-sync-README.md for setup.
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -206,10 +207,6 @@ class Twos:
         except RuntimeError:
             return None
 
-    def tags(self):
-        d = self._get("/tags")
-        return d.get("tags", [])
-
 
 # ------------------------------------------------------------- config loading
 
@@ -329,28 +326,6 @@ def render_clipping(t, lists, cfg):
         body.append("")
         body.append(f"![]({p})")
     return frontmatter(props) + "\n" + "\n".join(body) + "\n"
-
-
-def render_task(t, lists, cfg):
-    cats, tags = map_tags(t.get("tags"), cfg)
-    text = (t.get("text") or "").strip()
-    list_title = lists.get(t.get("list_id"), {}).get("title", "unknown")
-    status = "done" if t.get("completed") else "todo"
-    box = "x" if t.get("completed") else " "
-    props = {
-        "created": local_date(parse_iso(t.get("created"))),
-        "type": "task",
-        "origin": "twos",
-        "twos_id": t.get("id"),
-        "twos_list": list_title,
-        "categories": cats,
-        "tags": tags,
-        "status": status,
-    }
-    line = f"- [{box}] {text}"
-    if t.get("url"):
-        line += f" {t['url']}"
-    return frontmatter(props) + "\n" + line + "\n"
 
 
 def render_list_note(title, things, list_created, cfg):
@@ -485,12 +460,6 @@ def pick_atomic_kind(t):
     return None
 
 
-def is_grouped(t):
-    """True if a thing routes to a compound note (daily section or list note).
-    Under option (c) that's: todos, plain notes. Clippings are atomic."""
-    return pick_atomic_kind(t) is None
-
-
 def unique_path(vault, name, twos_id):
     """Resolve a filename under <vault>/Things/, avoiding collisions."""
     dest = vault / IMPORT_DIR
@@ -519,7 +488,7 @@ def run(args):
     cfg = load_config(vault)
 
     # API key
-    key = os_get("TWOS_API_KEY")
+    key = os.environ.get("TWOS_API_KEY")
     if key:
         log(f"Using TWOS_API_KEY from environment.")
     else:
@@ -532,9 +501,11 @@ def run(args):
 
     tw = Twos(key)
 
-    # State
+    # State — always load (even in --full) to preserve the twos_id->path map for renames.
+    # In --full mode we just null the cursor; in --list mode we keep everything and
+    # skip cursor advancement at the end.
     state = {"cursor": None, "things": {}}
-    if STATE_PATH.exists() and not args.full:
+    if STATE_PATH.exists():
         try:
             state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
@@ -593,12 +564,11 @@ def run(args):
         lists[lid] = li
         return li
 
-    # Bucket
-    daily_dates = {}        # date_str -> list of things (from this delta)
-    permlist_new = {}       # list_id -> list of grouped things touched
-    atomic_jobs = []        # (kind, thing) -- clippings only under option (c)
-    tasks_grouped = 0       # count of todos routed to compound notes
-    unknown_list_count = 0
+    # Bucket — also pre-group for O(1) lookups in full mode
+    daily_dates = {}        # date_str -> list of things
+    permlist_new = {}       # list_id -> list of things (grouped + clippings)
+    atomic_jobs = []        # (kind, thing) -- clippings only
+    tasks_grouped = 0
     unmapped_tags = set()
 
     for t in things:
@@ -615,29 +585,23 @@ def run(args):
                 daily_dates.setdefault(local_date(dt), []).append(t)
             elif kind:
                 atomic_jobs.append((kind, t))
-            # else: skip undated empty
         else:
             if kind:
-                # Clippings are atomic AND appear in their list's compound note
                 atomic_jobs.append((kind, t))
                 if li is not None:
                     permlist_new.setdefault(lid, []).append(t)
-            elif li is None:
-                unknown_list_count += 1
-            else:
+            elif li is not None:
                 permlist_new.setdefault(lid, []).append(t)
                 if t.get("type") == "todo":
                     tasks_grouped += 1
 
     # Atomic notes
-    new_atomic, upd_atomic = 0, 0
-    plans = []  # for dry-run reporting
+    n_new, n_upd = 0, 0
     id_map = dict(state.get("things") or {})
 
     for kind, t in atomic_jobs:
         text = (t.get("text") or "").strip()
         url = (t.get("url") or "").strip()
-        # option (c): only clippings are atomic
         base = sanitize_filename(text or url, f"twos-{(t.get('id') or 'x')[:6]}")
         content = render_clipping(t, lists, cfg)
         if not base.endswith(".md"):
@@ -646,29 +610,20 @@ def run(args):
         existing = id_map.get(tid)
         if existing and (vault / existing).exists():
             old_path = vault / existing
-            # Fix C: check if the desired filename differs from the stored path
             desired = vault / IMPORT_DIR / base
-            if old_path != desired:
-                # Desired name differs — try to rename
-                if not desired.exists():
-                    if not args.dry_run:
-                        old_path.rename(desired)
-                        log(f"  renamed: {existing} -> {desired.relative_to(vault)}", logging.DEBUG)
-                    target = desired
-                else:
-                    # Collision — keep old path, just update content
-                    target = old_path
+            if old_path != desired and not desired.exists():
+                if not args.dry_run:
+                    old_path.rename(desired)
+                    log(f"  renamed: {existing} -> {desired.relative_to(vault)}", logging.DEBUG)
+                target = desired
             else:
                 target = old_path
             action = "upd"
+            n_upd += 1
         else:
             target = unique_path(vault, base, tid)
             action = "new"
-        plans.append(("atomic", kind, action, str(target.relative_to(vault)), t))
-        if action == "new":
-            new_atomic += 1
-        else:
-            upd_atomic += 1
+            n_new += 1
         if not args.dry_run:
             atomic_write(target, content)
             id_map[tid] = str(target.relative_to(vault))
@@ -678,10 +633,7 @@ def run(args):
     daily_touched = []
     for date_str in sorted(daily_dates):
         if have_full:
-            day_things = [t for t in things
-                          if lists.get(t.get("list_id"), {}).get("today")
-                          and parse_iso(t.get("created"))
-                          and local_date(parse_iso(t.get("created"))) == date_str]
+            day_things = daily_dates[date_str]
         else:
             day_things = tw.today(date_str)
         section_body = render_daily_section(day_things)
@@ -707,7 +659,7 @@ def run(args):
             continue
         title = li.get("title") or "untitled"
         if have_full:
-            all_in_list = [t for t in things if t.get("list_id") == lid]
+            all_in_list = permlist_new[lid]
         else:
             all_in_list = tw.things(list_id=lid)
         list_path = vault / IMPORT_DIR / f"Twos - {sanitize_filename(title, 'untitled')}.md"
@@ -720,17 +672,17 @@ def run(args):
             atomic_write(list_path, content)
             log(f"  {'wrote' if not existed else 'updated'}: {list_path.relative_to(vault)}", logging.DEBUG)
 
-    # Cursor = max updated seen
-    new_cursor = max((t.get("updated") or t.get("created") or "") for t in things) if things else state.get("cursor")
+    # Cursor = max updated seen (skip in --list mode to avoid regression)
+    if args.list:
+        new_cursor = state.get("cursor")
+    else:
+        new_cursor = max((t.get("updated") or t.get("created") or "") for t in things) if things else state.get("cursor")
 
     # ---- Report ----
-    n_clip_new = sum(1 for p in plans if p[1] == "clipping" and p[2] == "new")
-    n_clip_upd = sum(1 for p in plans if p[1] == "clipping" and p[2] == "upd")
     log("")
     log(f"Twos sync {'(DRY-RUN)' if args.dry_run else '(APPLIED)'}")
     log(f"  Things processed: {len(things)}  ({tw._n} API calls)")
-    log(f"  Atomic clippings (-> {IMPORT_DIR}/): {n_clip_new + n_clip_upd} "
-        f"({n_clip_new} new, {n_clip_upd} upd)")
+    log(f"  Atomic clippings (-> {IMPORT_DIR}/): {n_new + n_upd} ({n_new} new, {n_upd} upd)")
     log(f"  Tasks grouped into list notes: {tasks_grouped}")
     log(f"  Daily notes touched (-> {DAILY_DIR}/): {len(daily_touched)} "
         f"({sum(1 for _, s in daily_touched if s == 'new')} new)")
@@ -740,8 +692,6 @@ def run(args):
         log(f"  Lazy-resolved lists (archived/unknown): {len(extra_lists)}")
     if unresolved_lists:
         log(f"  Deleted/unresolvable lists (things imported as 'Deleted list'): {len(unresolved_lists)}", logging.WARNING)
-    if unknown_list_count:
-        log(f"  Things in unresolved lists skipped: {unknown_list_count}", logging.WARNING)
     if unmapped_tags:
         log(f"  Unmapped tags (consider adding to {CFG_YAML}): "
             f"{', '.join(sorted(unmapped_tags)[:20])}"
@@ -754,7 +704,7 @@ def run(args):
         log("## Sync complete (dry-run)\n")
         return
 
-    # Persist state
+    # Persist state (skip cursor advance in --list mode)
     state["cursor"] = new_cursor
     state["things"] = id_map
     state["lists"] = extra_lists
@@ -769,16 +719,10 @@ def _save_state(state):
     STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def os_get(name):
-    import os
-    return os.environ.get(name)
-
-
 # --------------------------------------------------------------- self-test
 
 def self_test():
     log("Running self-test...")
-    ok = True
 
     # parse_iso / local
     dt = parse_iso("2026-08-01T14:49:00.000Z")
@@ -789,7 +733,6 @@ def self_test():
     # sanitize
     assert sanitize_filename("", "fb") == "fb", "sanitize empty"
     assert sanitize_filename("#tag in name", "fb") == "tag in name", "sanitize hash"
-    # Fix B: '/' -> '-' and truncate at ':'
     assert sanitize_filename("nchrtd22/twos-obsidian-sync: One-way import", "fb") == "nchrtd22-twos-obsidian-sync", \
         f"sanitize slash/colon: {sanitize_filename('nchrtd22/twos-obsidian-sync: One-way import', 'fb')}"
     assert sanitize_filename("site/page|extra", "fb") == "site-page", "sanitize pipe"
@@ -813,7 +756,6 @@ def self_test():
     base = "---\ncreated: 2026-08-01\ntype: daily\n---\n\n# 2026-08-01\n\nSome journal.\n"
     out = upsert_twos_section(base, "- 09:00 Hello\n")
     assert "## Twos" in out and "- 09:00 Hello" in out and "Some journal." in out, "insert"
-    # replace existing
     out2 = upsert_twos_section(out, "- 10:00 Bye\n")
     assert "- 09:00 Hello" not in out2 and "- 10:00 Bye" in out2, "replace"
     assert out2.count("## Twos") == 1, "single section"
@@ -834,8 +776,6 @@ def self_test():
     assert pick_atomic_kind({"type": "todo", "url": "https://x.no"}) is None, "todo not atomic"
     assert pick_atomic_kind({"type": "note", "url": "https://x.no"}) == "clipping", "url->clipping"
     assert pick_atomic_kind({"type": "note", "text": "hei"}) is None, "plain not atomic"
-    assert is_grouped({"type": "todo"}) and is_grouped({"type": "note", "text": "x"}), "grouped"
-    assert not is_grouped({"type": "note", "url": "https://x.no"}), "clipping not grouped"
 
     # render_list_note renders todos as checkboxes + urls as links
     list_things = [
@@ -852,8 +792,7 @@ def self_test():
     assert "- Ren tekst" in note, "list: plain bullet"
     assert "[[Studies]]" in note, "list: category from tags"
 
-    if ok:
-        log("Self-test PASSED.")
+    log("Self-test PASSED.")
     return 0
 
 
