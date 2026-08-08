@@ -726,15 +726,15 @@ def self_test():
     # sanitize
     assert sanitize_filename("", "fb") == "fb", "sanitize empty"
     assert sanitize_filename("#tag in name", "fb") == "tag in name", "sanitize hash"
-    assert sanitize_filename("nchrtd22/twos-obsidian-sync: One-way import", "fb") == "nchrtd22-twos-obsidian-sync", \
-        f"sanitize slash/colon: {sanitize_filename('nchrtd22/twos-obsidian-sync: One-way import', 'fb')}"
+    assert sanitize_filename("site/repo-name: A description", "fb") == "site-repo-name", \
+        f"sanitize slash/colon: {sanitize_filename('site/repo-name: A description', 'fb')}"
     assert sanitize_filename("site/page|extra", "fb") == "site-page", "sanitize pipe"
     long = "x" * 200
     assert len(sanitize_filename(long, "fb")) <= FN_MAX + 5, "sanitize trunc"
 
     # map_tags
     cfg = {
-        "cat_map": {"master": "[[Studies]]", "reise": "[[Travel]]"},
+        "cat_map": {"study": "[[Studies]]", "travel": "[[Travel]]"},
         "drop": ["chrome"],
         "default_cat": "[[Inbox]]",
     }
@@ -742,7 +742,7 @@ def self_test():
     assert cats == ["[[Inbox]]"], f"cats default: {cats}"
     assert "newtag" in tags and "random" in tags and "chrome" not in tags and "123" not in tags, \
         f"tags filter: {tags}"
-    cats2, _ = map_tags(["master", "reise"], cfg)
+    cats2, _ = map_tags(["study", "travel"], cfg)
     assert cats2 == ["[[Studies]]", "[[Travel]]"], f"multi-cat: {cats2}"
 
     # upsert_twos_section
@@ -755,34 +755,34 @@ def self_test():
 
     # render_daily_section
     things = [
-        {"type": "todo", "completed": True, "text": "Ring", "created": "2026-08-01T12:58:00Z"},
-        {"type": "note", "text": "Hei", "url": "https://x.no", "created": "2026-08-01T11:00:00Z"},
+        {"type": "todo", "completed": True, "text": "Call dad", "created": "2026-08-01T12:58:00Z"},
+        {"type": "note", "text": "Hello", "url": "https://example.com", "created": "2026-08-01T11:00:00Z"},
     ]
     body = render_daily_section(things)
-    assert "- [x]" in body and "[Hei](https://x.no)" in body, "daily render"
+    assert "- [x]" in body and "[Hello](https://example.com)" in body, "daily render"
 
     # frontmatter quoting
-    fm = frontmatter({"categories": ["[[Studies]]"], "source": "https://x.no/p", "type": "clipping"})
-    assert '"[[Studies]]"' in fm and '"https://x.no/p"' in fm, "fm quoting"
+    fm = frontmatter({"categories": ["[[Studies]]"], "source": "https://example.com/p", "type": "clipping"})
+    assert '"[[Studies]]"' in fm and '"https://example.com/p"' in fm, "fm quoting"
 
     # option (c) routing: todos are NOT atomic; only url non-todos are clippings
-    assert pick_atomic_kind({"type": "todo", "url": "https://x.no"}) is None, "todo not atomic"
-    assert pick_atomic_kind({"type": "note", "url": "https://x.no"}) == "clipping", "url->clipping"
-    assert pick_atomic_kind({"type": "note", "text": "hei"}) is None, "plain not atomic"
+    assert pick_atomic_kind({"type": "todo", "url": "https://example.com"}) is None, "todo not atomic"
+    assert pick_atomic_kind({"type": "note", "url": "https://example.com"}) == "clipping", "url->clipping"
+    assert pick_atomic_kind({"type": "note", "text": "hello"}) is None, "plain not atomic"
 
     # render_list_note renders todos as checkboxes + urls as links
     list_things = [
-        {"type": "todo", "completed": False, "text": "Les artikler", "created": "2026-01-01T08:00:00Z", "tags": ["master"]},
-        {"type": "todo", "completed": True, "text": "Send billett", "created": "2026-01-02T08:00:00Z"},
-        {"type": "note", "text": "Sjekk denne", "url": "https://obsidian.md", "created": "2026-01-03T08:00:00Z"},
-        {"type": "note", "text": "Ren tekst", "created": "2026-01-04T08:00:00Z"},
+        {"type": "todo", "completed": False, "text": "Read articles", "created": "2026-01-01T08:00:00Z", "tags": ["study"]},
+        {"type": "todo", "completed": True, "text": "Send ticket", "created": "2026-01-02T08:00:00Z"},
+        {"type": "note", "text": "Check this", "url": "https://obsidian.md", "created": "2026-01-03T08:00:00Z"},
+        {"type": "note", "text": "Plain text", "created": "2026-01-04T08:00:00Z"},
     ]
-    cfg2 = {"cat_map": {"master": "[[Studies]]"}, "drop": [], "default_cat": "[[Inbox]]"}
-    note = render_list_note("OLA 1", list_things, "2026-01-01T00:00:00Z", cfg2)
-    assert "- [ ] Les artikler" in note, "list: open task"
-    assert "- [x] Send billett" in note, "list: done task"
-    assert "[Sjekk denne](https://obsidian.md)" in note, "list: url link"
-    assert "- Ren tekst" in note, "list: plain bullet"
+    cfg2 = {"cat_map": {"study": "[[Studies]]"}, "drop": [], "default_cat": "[[Inbox]]"}
+    note = render_list_note("Project A", list_things, "2026-01-01T00:00:00Z", cfg2)
+    assert "- [ ] Read articles" in note, "list: open task"
+    assert "- [x] Send ticket" in note, "list: done task"
+    assert "[Check this](https://obsidian.md)" in note, "list: url link"
+    assert "- Plain text" in note, "list: plain bullet"
     assert "[[Studies]]" in note, "list: category from tags"
 
     log("Self-test PASSED.")
