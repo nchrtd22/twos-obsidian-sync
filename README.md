@@ -5,6 +5,13 @@ writes it into this vault as properly-frontmattered Markdown notes. Idempotent
 and incremental: re-run as often as you like; it only pulls things changed
 since the last run and updates notes in place via a stable `twos_id`.
 
+> [!warning] Disclaimer
+> This script writes, creates, and renames files in your Obsidian vault. It is
+> provided **as-is, without warranty**, and you run it at your own risk. Always
+> run `--dry-run` first to preview what will happen, and **back up your vault**
+> before the first real run. The author is not responsible for data loss,
+> duplicated files, or any other damage.
+
 ## What it produces
 
 | Twos entry | Lands as | Destination |
