@@ -1,0 +1,41 @@
+# twos-import-map.example.yaml -- Tag -> category mapping for twos_sync.py
+#
+# Copy this file to `twos-import-map.yaml` in your Obsidian vault root and
+# customize it with YOUR tags. Tags are matched case-insensitively;
+# '#'-prefix is stripped automatically.
+#
+# A thing's tags drive its `categories:` frontmatter. Unmapped tags are still
+# kept in the note's `tags:` list (just not assigned a category) and default
+# to [[Inbox]].
+#
+# Format:
+#   categories:
+#     <comma-separated twos tags>: "<[[Category]]>"
+#   drop:   [tags to discard entirely]
+#   default_category: "[[Inbox]]"
+
+categories:
+  # Replace these with your own tags and category names.
+  # Categories should be wikilinks to notes that exist (or will exist) in your vault.
+  work, project-a, project-b: "[[Work]]"
+  travel, trip: "[[Travel]]"
+  sports, football: "[[Sports]]"
+  family, home, personal: "[[Personal]]"
+  finance, bills, budget: "[[Finance]]"
+  tech, linux, git, terminal: "[[Tech]]"
+  music, rock, jazz: "[[Music]]"
+  study, course, reading: "[[Studies]]"
+
+drop:
+  # Tags from the Twos app itself (browser source, etc.) -- discard these
+  - chrome
+  - firefox
+  - email
+  - facebook
+  - twos
+  # Add your own low-value tags here
+
+default_category: "[[Inbox]]"
+
+# Tip: run `python3 twos_sync.py --dry-run` and watch the "Unmapped tags" line
+# to discover tags you may want to add here.
