@@ -18,10 +18,12 @@ See twos-sync-README.md for setup.
 
 import argparse
 import json
+import logging
 import re
 import sys
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib import parse as urlparse
 from urllib import request as urlreq
@@ -35,17 +37,53 @@ STATE_PATH = Path("~/.local/share/twos-sync/state.json").expanduser()
 SECTION_HEADER = "## Twos"
 DAILY_DIR = "Daily"
 IMPORT_DIR = "Things"     # non-daily Twos imports land here (staging)
+LOG_DIR = "_logs"
+LOG_FILE = "twos-sync.log"
 MAX_PAGES = 400
 REQ_DELAY = 0.12           # seconds between API calls (limit ~17/min, we use ~8/min)
 FN_MAX = 60
 
 BAD_FN = re.compile(r'[/\\?%*:|"<>\x00-\x1f#]')
 
+# Will be configured by setup_logging()
+_logger = None
+
 
 # ------------------------------------------------------------- small helpers
 
-def log(msg):
-    print(msg, flush=True)
+def log(msg, level=logging.INFO):
+    """Write to both stdout and the file logger."""
+    if _logger:
+        _logger.log(level, msg)
+    else:
+        print(msg, flush=True)
+
+
+def setup_logging(vault, verbose=False):
+    """Configure dual-output logging: stdout (plain) + rotating file (markdown-formatted)."""
+    global _logger
+    log_dir = vault / LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / LOG_FILE
+
+    logger = logging.getLogger("twos_sync")
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.handlers.clear()
+
+    # File handler: rotating, markdown-formatted lines
+    fh = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+    fh.setLevel(logging.DEBUG if verbose else logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+
+    # Stdout handler: same format for interactive runs
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.DEBUG if verbose else logging.INFO)
+    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(sh)
+
+    _logger = logger
+    return logger
 
 
 def parse_iso(s):
@@ -64,7 +102,13 @@ def local_time(dt):
 
 
 def sanitize_filename(text, fallback):
-    t = BAD_FN.sub("", text or "")
+    t = text or ""
+    # Truncate at first ':' or '|' — common in page titles like "Site: Page"
+    for sep in (":", "|"):
+        if sep in t:
+            t = t.split(sep, 1)[0]
+    # Replace '/' with '-' instead of stripping (preserves readability: repo/path -> repo-path)
+    t = BAD_FN.sub("", t.replace("/", "-"))
     t = re.sub(r"\s+", " ", t).strip().strip(".").strip()
     if len(t) > FN_MAX:
         t = t[:FN_MAX].rsplit(" ", 1)[0].strip()
@@ -113,7 +157,7 @@ class Twos:
             except HTTPError as e:
                 if e.code == 429 and attempt < 4:
                     wait = 45 * (attempt + 1)
-                    log(f"  rate limited (429); sleeping {wait}s")
+                    log(f"Rate limited (429); sleeping {wait}s", logging.WARNING)
                     time.sleep(wait)
                     continue
                 body = ""
@@ -159,8 +203,7 @@ class Twos:
         try:
             d = self._get(f"/lists/{list_id}")
             return d.get("list") or d
-        except RuntimeError as e:
-            log(f"  WARN: could not resolve list {list_id}: {e}")
+        except RuntimeError:
             return None
 
     def tags(self):
@@ -470,6 +513,9 @@ def run(args):
     if not vault.exists():
         sys.exit(f"vault not found: {vault}")
 
+    setup_logging(vault, verbose=args.verbose)
+    log(f"## Sync started ({'dry-run' if args.dry_run else 'live'}, mode={'full' if args.full else 'delta'})")
+
     cfg = load_config(vault)
 
     # API key
@@ -524,6 +570,7 @@ def run(args):
 
     # Lazy-list resolution cache (unknown/archived lists) + restore from state
     extra_lists = dict(state.get("lists") or {})
+    unresolved_lists = []   # list_ids that 404'd (-> "Deleted list" stubs)
 
     def resolve_list(lid):
         """Return List dict for lid (from maps, extra_lists, or GET /lists/{id}).
@@ -541,6 +588,7 @@ def run(args):
         if li is None:
             # 404 / unresolvable -> synthetic stub so things still import
             li = {"id": lid, "title": "Deleted list", "today": False, "archived": True}
+            unresolved_lists.append(lid)
         extra_lists[lid] = li
         lists[lid] = li
         return li
@@ -570,7 +618,10 @@ def run(args):
             # else: skip undated empty
         else:
             if kind:
+                # Clippings are atomic AND appear in their list's compound note
                 atomic_jobs.append((kind, t))
+                if li is not None:
+                    permlist_new.setdefault(lid, []).append(t)
             elif li is None:
                 unknown_list_count += 1
             else:
@@ -594,7 +645,21 @@ def run(args):
         tid = t.get("id")
         existing = id_map.get(tid)
         if existing and (vault / existing).exists():
-            target = vault / existing
+            old_path = vault / existing
+            # Fix C: check if the desired filename differs from the stored path
+            desired = vault / IMPORT_DIR / base
+            if old_path != desired:
+                # Desired name differs — try to rename
+                if not desired.exists():
+                    if not args.dry_run:
+                        old_path.rename(desired)
+                        log(f"  renamed: {existing} -> {desired.relative_to(vault)}", logging.DEBUG)
+                    target = desired
+                else:
+                    # Collision — keep old path, just update content
+                    target = old_path
+            else:
+                target = old_path
             action = "upd"
         else:
             target = unique_path(vault, base, tid)
@@ -607,6 +672,7 @@ def run(args):
         if not args.dry_run:
             atomic_write(target, content)
             id_map[tid] = str(target.relative_to(vault))
+            log(f"  {'wrote' if action=='new' else 'updated'}: {target.relative_to(vault)}", logging.DEBUG)
 
     # Daily notes
     daily_touched = []
@@ -631,8 +697,9 @@ def run(args):
         daily_touched.append((date_str, "upd" if existed else "new"))
         if not args.dry_run and new_content != content:
             atomic_write(path, new_content)
+            log(f"  {'wrote' if not existed else 'updated'}: {path.relative_to(vault)}", logging.DEBUG)
 
-    # Permanent-list compound notes (now contain todos + plain notes; URLs are atomic)
+    # Permanent-list compound notes (contain ALL things: todos, plain notes, URLs as links)
     list_notes = []
     for lid, touched in permlist_new.items():
         li = lists.get(lid)
@@ -640,17 +707,18 @@ def run(args):
             continue
         title = li.get("title") or "untitled"
         if have_full:
-            grouped = [t for t in things if t.get("list_id") == lid and is_grouped(t)]
+            all_in_list = [t for t in things if t.get("list_id") == lid]
         else:
-            grouped = [t for t in tw.things(list_id=lid) if is_grouped(t)]
+            all_in_list = tw.things(list_id=lid)
         list_path = vault / IMPORT_DIR / f"Twos - {sanitize_filename(title, 'untitled')}.md"
-        if not grouped and not list_path.exists():
+        if not all_in_list and not list_path.exists():
             continue
-        content = render_list_note(title, grouped, li.get("created"), cfg)
+        content = render_list_note(title, all_in_list, li.get("created"), cfg)
         existed = list_path.exists()
         list_notes.append((title, "upd" if existed else "new"))
         if not args.dry_run:
             atomic_write(list_path, content)
+            log(f"  {'wrote' if not existed else 'updated'}: {list_path.relative_to(vault)}", logging.DEBUG)
 
     # Cursor = max updated seen
     new_cursor = max((t.get("updated") or t.get("created") or "") for t in things) if things else state.get("cursor")
@@ -670,17 +738,20 @@ def run(args):
         f"({sum(1 for _, s in list_notes if s == 'new')} new)")
     if extra_lists:
         log(f"  Lazy-resolved lists (archived/unknown): {len(extra_lists)}")
+    if unresolved_lists:
+        log(f"  Deleted/unresolvable lists (things imported as 'Deleted list'): {len(unresolved_lists)}", logging.WARNING)
     if unknown_list_count:
-        log(f"  Things in unresolved lists skipped: {unknown_list_count}")
+        log(f"  Things in unresolved lists skipped: {unknown_list_count}", logging.WARNING)
     if unmapped_tags:
         log(f"  Unmapped tags (consider adding to {CFG_YAML}): "
             f"{', '.join(sorted(unmapped_tags)[:20])}"
-            + (f"  (+{len(unmapped_tags) - 20} more)" if len(unmapped_tags) > 20 else ""))
+            + (f"  (+{len(unmapped_tags) - 20} more)" if len(unmapped_tags) > 20 else ""),
+            logging.WARNING)
     log(f"  Cursor: {state.get('cursor') or 'none'}  ->  {new_cursor}")
 
     if args.dry_run:
-        log("")
         log("Dry-run: no files written, no state change.")
+        log("## Sync complete (dry-run)\n")
         return
 
     # Persist state
@@ -690,6 +761,7 @@ def run(args):
     state["updated"] = datetime.now().astimezone().isoformat()
     _save_state(state)
     log(f"State saved to {STATE_PATH}")
+    log("## Sync complete\n")
 
 
 def _save_state(state):
@@ -715,10 +787,12 @@ def self_test():
     assert re.match(r"\d{2}:\d{2}", local_time(dt)), "local_time"
 
     # sanitize
-    assert sanitize_filename("a/b\\c?d:e*g", "fb") == "abcde g" or \
-           sanitize_filename("a/b\\c?d", "fb") == "abcd", "sanitize basic"
     assert sanitize_filename("", "fb") == "fb", "sanitize empty"
     assert sanitize_filename("#tag in name", "fb") == "tag in name", "sanitize hash"
+    # Fix B: '/' -> '-' and truncate at ':'
+    assert sanitize_filename("nchrtd22/twos-obsidian-sync: One-way import", "fb") == "nchrtd22-twos-obsidian-sync", \
+        f"sanitize slash/colon: {sanitize_filename('nchrtd22/twos-obsidian-sync: One-way import', 'fb')}"
+    assert sanitize_filename("site/page|extra", "fb") == "site-page", "sanitize pipe"
     long = "x" * 200
     assert len(sanitize_filename(long, "fb")) <= FN_MAX + 5, "sanitize trunc"
 
@@ -789,6 +863,7 @@ def main():
     ap.add_argument("--full", action="store_true", help="Ignore cursor; fetch everything.")
     ap.add_argument("--list", metavar="ID", help="Restrict to one list id (rebuild only that).")
     ap.add_argument("--vault", metavar="PATH", help="Vault root (default: script's parent).")
+    ap.add_argument("--verbose", action="store_true", help="Log per-note-write details.")
     ap.add_argument("--self-test", action="store_true", help="Run built-in tests and exit.")
     args = ap.parse_args()
 
