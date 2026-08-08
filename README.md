@@ -13,8 +13,7 @@ since the last run and updates notes in place via a stable `twos_id`.
 > duplicated files, or any other damage.
 
 > [!note] Built with AI
-> This script was written through collaboration with an AI assistant (vibe
-> coded). The code has been tested against a real Twos account and Obsidian
+> This script was written through collaboration with an AI assistant. The code has been tested against a real Twos account and Obsidian
 > vault, but review it before relying on it.
 
 ## What it produces
