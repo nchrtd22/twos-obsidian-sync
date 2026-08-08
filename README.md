@@ -12,6 +12,11 @@ since the last run and updates notes in place via a stable `twos_id`.
 > before the first real run. The author is not responsible for data loss,
 > duplicated files, or any other damage.
 
+> [!note] Built with AI
+> This script was written through collaboration with an AI assistant (vibe
+> coded). The code has been tested against a real Twos account and Obsidian
+> vault, but review it before relying on it.
+
 ## What it produces
 
 | Twos entry | Lands as | Destination |
