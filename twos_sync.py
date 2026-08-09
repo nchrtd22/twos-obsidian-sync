@@ -466,6 +466,27 @@ def unique_path(vault, name, twos_id):
     return cand2
 
 
+def resolve_list(lid, lists, extra_lists, tw, unresolved_lists):
+    """Return List dict for lid (from maps, extra_lists, or GET /lists/{id}).
+    Caches positive AND negative results. Returns a synthetic stub for
+    null/empty ids and 404s so things are still imported, not skipped."""
+    if not lid:
+        if "unlisted" not in extra_lists:
+            extra_lists["unlisted"] = {"id": "", "title": "Unlisted", "today": False, "archived": False}
+        return extra_lists["unlisted"]
+    if lid in lists:
+        return lists[lid]
+    if lid in extra_lists:
+        return extra_lists[lid]
+    li = tw.list(lid)
+    if li is None:
+        li = {"id": lid, "title": "Deleted list", "today": False, "archived": True}
+        unresolved_lists.append(lid)
+    extra_lists[lid] = li
+    lists[lid] = li
+    return li
+
+
 def run(args):
     vault = Path(args.vault).resolve() if args.vault else Path(__file__).resolve().parents[1]
     if not vault.exists():
@@ -530,27 +551,9 @@ def run(args):
             _save_state(state)
         return
 
-def resolve_list(lid, lists, extra_lists, tw, unresolved_lists):
-    """Return List dict for lid (from maps, extra_lists, or GET /lists/{id}).
-    Caches positive AND negative results. Returns a synthetic stub for
-    null/empty ids and 404s so things are still imported, not skipped."""
-    if not lid:
-        # Orphaned things (no list) -> bucket into a synthetic "Unlisted" list
-        if "unlisted" not in extra_lists:
-            extra_lists["unlisted"] = {"id": "", "title": "Unlisted", "today": False, "archived": False}
-        return extra_lists["unlisted"]
-    if lid in lists:
-        return lists[lid]
-    if lid in extra_lists:
-        return extra_lists[lid]
-    li = tw.list(lid)
-    if li is None:
-        # 404 / unresolvable -> synthetic stub so things still import
-        li = {"id": lid, "title": "Deleted list", "today": False, "archived": True}
-        unresolved_lists.append(lid)
-    extra_lists[lid] = li
-    lists[lid] = li
-    return li
+    # Lazy-list resolution cache (unknown/archived lists) + restore from state
+    extra_lists = dict(state.get("lists") or {})
+    unresolved_lists = []
 
     # Bucket — also pre-group for O(1) lookups in full mode
     daily_dates = {}        # date_str -> list of things
