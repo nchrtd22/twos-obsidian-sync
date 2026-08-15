@@ -296,7 +296,31 @@ def _aggregate_tags(things, cfg):
         tags.update(tg)
     if not cats:
         cats = [cfg["default_cat"]]
-    return cats, tags
+    return cats, sorted(tags)
+
+
+def _apply_formatting(text, t):
+    """Apply bold, italic, underline formatting to text based on thing's formatting flags.
+    Order: bold -> italic -> underline (innermost to outermost for proper nesting)."""
+    if not text:
+        return text
+    # Apply in order: bold, then italic, then underline
+    # This creates **_<u>text</u>_** for all three
+    if t.get("bold"):
+        text = f"**{text}**"
+    if t.get("italic"):
+        text = f"_{text}_"
+    if t.get("underline"):
+        text = f"<u>{text}</u>"
+    return text
+
+
+def _get_list_name(list_id, lists):
+    """Get list name from lists dict, or return the ID if not found."""
+    if not list_id:
+        return ""
+    list_info = lists.get(list_id, {})
+    return list_info.get("title", list_id)
 
 
 def render_clipping(t, lists, cfg):
@@ -315,19 +339,44 @@ def render_clipping(t, lists, cfg):
         "tags": tags,
         "source": url,
     }
-    body = [f"# {title}"]
+    # Add optional fields if present
+    if t.get("list_ref"):
+        props["twos_list_ref"] = t["list_ref"]
+    if t.get("favorited"):
+        props["favorited"] = True
+    if t.get("clone_of"):
+        props["twos_clone_of"] = t["clone_of"]
+    if t.get("has_clones"):
+        props["twos_has_clones"] = True
+    
+    body = [f"# {_apply_formatting(title, t)}"]
     if url:
         body.append("")
         body.append(f"{url}")
     for p in t.get("photos") or []:
         body.append("")
         body.append(f"![]({p})")
+    # Add the long-form note if present
+    if t.get("note"):
+        body.append("")
+        body.append("")
+        body.append(t["note"].strip())
     return frontmatter(props) + "\n" + "\n".join(body) + "\n"
 
 
-def render_list_note(title, things, list_created, cfg):
+def render_list_note(title, things, list_created, cfg, lists=None):
     """Compound note for a permanent list. Renders ALL thing kinds (option c):
-    todos as checkboxes, URLs as links, plain notes as bullets."""
+    todos as checkboxes, URLs as links, plain notes as bullets.
+    
+    Args:
+        title: List title
+        things: List of thing dicts to render
+        list_created: ISO datetime string for list creation
+        cfg: Config dict with cat_map, drop, default_cat
+        lists: Optional dict of list_id -> list_info for resolving list_ref names
+    """
+    if lists is None:
+        lists = {}
     cats, tags = _aggregate_tags(things, cfg)
     props = {
         "created": local_date(parse_iso(list_created)) if list_created else None,
@@ -340,53 +389,115 @@ def render_list_note(title, things, list_created, cfg):
     for t in sorted(things, key=lambda x: x.get("created", "")):
         text = (t.get("text") or "").strip()
         url = (t.get("url") or "").strip()
-        indent = "  " * (t.get("tabs") or 0)
+        # Apply formatting to text
+        text = _apply_formatting(text, t)
+        # Limit tabs to reasonable range (0-5 levels)
+        indent = "  " * max(0, min(5, t.get("tabs") or 0))
+        
+        # Add favorited marker if present
+        fav_marker = "⭐ " if t.get("favorited") else ""
+        
         if t.get("type") == "todo":
             box = "x" if t.get("completed") else " "
-            line = f"{indent}- [{box}] {text}".rstrip()
+            line = f"{indent}- [{box}] {fav_marker}{text}".rstrip()
             if url:
                 line += f" {url}"
+            if t.get("canceled"):
+                line = f"~~{line}~~"
             body.append(line)
         elif t.get("header"):
             body.append("")
-            body.append(f"## {text}")
+            body.append(f"## {fav_marker}{text}")
         elif t.get("subheader"):
             body.append("")
-            body.append(f"### {text}")
+            body.append(f"### {fav_marker}{text}")
         elif t.get("quote"):
-            body.append(f"{indent}> {text}")
+            body.append(f"{indent}> {fav_marker}{text}")
         elif t.get("code"):
-            body.append(f"{indent}`{text}`")
+            body.append(f"{indent}`{fav_marker}{text}`")
         elif url:
             label = text or url
-            body.append(f"{indent}- [{label}]({url})")
+            body.append(f"{indent}- {fav_marker}[{label}]({url})")
         elif text:
-            body.append(f"{indent}- {text}")
+            body.append(f"{indent}- {fav_marker}{text}")
         # else: empty entry -> skip
+        
+        # Add photos if present
+        for p in t.get("photos") or []:
+            body.append(f"{indent}  ![{text or 'image'}]({p})")
+        
+        # Add note if present
+        if t.get("note"):
+            note_text = t["note"].strip()
+            if note_text:
+                body.append(f"{indent}  > {note_text}")
+        
+        # Add list_ref as wikilink if present
+        if t.get("list_ref"):
+            ref_name = _get_list_name(t["list_ref"], lists)
+            if ref_name:
+                body.append(f"{indent}  - [[{ref_name}]]")
+        
+        # Add clone information if present
+        if t.get("clone_of"):
+            body.append(f"{indent}  - *Cloned from: {t['clone_of']}*")
+        if t.get("has_clones"):
+            body.append(f"{indent}  - *Has clones*")
     return frontmatter(props) + "\n" + "\n".join(body) + "\n"
 
 
-def render_daily_section(things):
-    """Body of the managed `## Twos` block for a daily note."""
+def render_daily_section(things, lists=None):
+    """Body of the managed `## Twos` block for a daily note.
+    
+    Args:
+        things: List of thing dicts to render
+        lists: Optional dict of list_id -> list_info for resolving list_ref names
+    """
+    if lists is None:
+        lists = {}
     lines = []
     for t in sorted(things, key=lambda x: x.get("created", "")):
         dt = parse_iso(t.get("created"))
         hhmm = local_time(dt) if dt else "??:??"
         text = (t.get("text") or "").strip()
         url = (t.get("url") or "").strip()
+        # Apply formatting to text
+        text = _apply_formatting(text, t)
+        
+        # Add favorited marker if present
+        fav_marker = "⭐ " if t.get("favorited") else ""
+        
         if t.get("type") == "todo":
             box = "x" if t.get("completed") else " "
-            content = f"- [{box}] {hhmm} {text}".rstrip()
+            content = f"- [{box}] {hhmm} {fav_marker}{text}".rstrip()
             if url:
                 content += f" {url}"
+            if t.get("canceled"):
+                content = f"~~{content}~~"
             lines.append(content)
         else:
             if url:
                 label = text or url
-                lines.append(f"- {hhmm} [{label}]({url})")
+                lines.append(f"- {hhmm} {fav_marker}[{label}]({url})")
             elif text:
-                lines.append(f"- {hhmm} {text}")
+                lines.append(f"- {hhmm} {fav_marker}{text}")
             # else: empty entry -> skip
+        
+        # Add photos if present
+        for p in t.get("photos") or []:
+            lines.append(f"  ![{text or 'image'}]({p})")
+        
+        # Add note if present
+        if t.get("note"):
+            note_text = t["note"].strip()
+            if note_text:
+                lines.append(f"  > {note_text}")
+        
+        # Add list_ref as wikilink if present
+        if t.get("list_ref") and lists:
+            ref_name = _get_list_name(t["list_ref"], lists)
+            if ref_name:
+                lines.append(f"  - [[{ref_name}]]")
     return "\n".join(lines) + "\n"
 
 
@@ -440,9 +551,10 @@ def atomic_write(path, content):
 # --------------------------------------------------------------- main pipeline
 
 def pick_atomic_kind(t):
-    """Option (c): only URL-bearing non-todo things become atomic clippings.
-    Todos fall through to the per-list compound note as checkboxes."""
-    if t.get("type") == "todo":
+    """Option (c): only URL-bearing non-todo/dash/number/bullet things become atomic clippings.
+    Todos, dash, number, bullet fall through to the per-list compound note."""
+    thing_type = t.get("type", "none")
+    if thing_type in ("todo", "dash", "number", "bullet"):
         return None
     if t.get("url"):
         return "clipping"
@@ -627,7 +739,7 @@ def run(args):
             day_things = daily_dates[date_str]
         else:
             day_things = tw.today(date_str)
-        section_body = render_daily_section(day_things)
+        section_body = render_daily_section(day_things, lists)
         if not section_body.strip():
             continue
         path = vault / DAILY_DIR / f"{date_str}.md"
@@ -656,7 +768,7 @@ def run(args):
         list_path = vault / IMPORT_DIR / f"Twos - {sanitize_filename(title, 'untitled')}.md"
         if not all_in_list and not list_path.exists():
             continue
-        content = render_list_note(title, all_in_list, li.get("created"), cfg)
+        content = render_list_note(title, all_in_list, li.get("created"), cfg, lists)
         existed = list_path.exists()
         list_notes.append((title, "upd" if existed else "new"))
         if not args.dry_run:
@@ -742,6 +854,14 @@ def self_test():
     cats2, _ = map_tags(["study", "travel"], cfg)
     assert cats2 == ["[[Studies]]", "[[Travel]]"], f"multi-cat: {cats2}"
 
+    # _aggregate_tags must return a list (not a set) so frontmatter renders it as YAML list, not a set repr
+    _, agg_tags = _aggregate_tags([
+        {"tags": ["tag1", "tag2"]},
+        {"tags": ["tag1", "tag3"]},
+    ], cfg)
+    assert isinstance(agg_tags, list), f"aggregate tags should be list, got {type(agg_tags)}"
+    assert agg_tags == ["tag1", "tag2", "tag3"], f"aggregate tags: {agg_tags}"
+
     # upsert_twos_section
     base = "---\ncreated: 2026-08-01\ntype: daily\n---\n\n# 2026-08-01\n\nSome journal.\n"
     out = upsert_twos_section(base, "- 09:00 Hello\n")
@@ -754,25 +874,74 @@ def self_test():
     things = [
         {"type": "todo", "completed": True, "text": "Call dad", "created": "2026-08-01T12:58:00Z"},
         {"type": "note", "text": "Hello", "url": "https://example.com", "created": "2026-08-01T11:00:00Z"},
+        {"type": "todo", "completed": False, "text": "Important", "bold": True, "created": "2026-08-01T10:00:00Z"},
+        {"type": "todo", "completed": True, "text": "Canceled", "canceled": True, "created": "2026-08-01T09:00:00Z"},
+        {"type": "note", "text": "With note", "note": "Extended note here", "created": "2026-08-01T08:00:00Z"},
+        {"type": "note", "text": "Favorited", "favorited": True, "created": "2026-08-01T07:00:00Z"},
+        {"type": "note", "text": "With photo", "photos": ["https://example.com/photo.jpg"], "created": "2026-08-01T06:00:00Z"},
     ]
-    body = render_daily_section(things)
+    lists = {"ref123": {"title": "Reference List"}}
+    things_with_ref = things + [
+        {"type": "note", "text": "With ref", "list_ref": "ref123", "created": "2026-08-01T05:00:00Z"}
+    ]
+    body = render_daily_section(things_with_ref, lists)
     assert "- [x]" in body and "[Hello](https://example.com)" in body, "daily render"
+    assert "**Important**" in body, "daily bold formatting"
+    assert "~~- [x]" in body and "Canceled~~" in body, "daily canceled strikethrough"
+    assert "> Extended note here" in body, "daily note field included"
+    assert "⭐ Favorited" in body, "daily favorited marker"
+    assert "![With photo](https://example.com/photo.jpg)" in body, "daily photo included"
+    assert "[[Reference List]]" in body, "daily list_ref wikilink"
 
     # frontmatter quoting
     fm = frontmatter({"categories": ["[[Studies]]"], "source": "https://example.com/p", "type": "clipping"})
     assert '"[[Studies]]"' in fm and '"https://example.com/p"' in fm, "fm quoting"
+    
+    # render_clipping with note field
+    clipping = {
+        "id": "test123",
+        "text": "Test Article",
+        "url": "https://example.com/article",
+        "note": "This is a long-form note about the article",
+        "type": "note",
+        "created": "2026-08-01T10:00:00Z",
+        "list_id": "list456",
+        "tags": ["tech"],
+    }
+    lists = {"list456": {"title": "Tech"}}
+    clipping_content = render_clipping(clipping, lists, cfg)
+    assert "# Test Article" in clipping_content, "clipping title"
+    assert "https://example.com/article" in clipping_content, "clipping url"
+    assert "This is a long-form note about the article" in clipping_content, "clipping note field"
+    
+    # _apply_formatting helper
+    assert _apply_formatting("hello", {"bold": True}) == "**hello**", "bold formatting"
+    assert _apply_formatting("hello", {"italic": True}) == "_hello_", "italic formatting"
+    assert _apply_formatting("hello", {"underline": True}) == "<u>hello</u>", "underline formatting"
+    # Note: formatting is applied in order bold->italic->underline, so combined creates nested markdown
+    assert _apply_formatting("hello", {"bold": True, "italic": True}) == "_**hello**_", "combined bold+italic"
+    assert _apply_formatting("hello", {"bold": True, "underline": True}) == "<u>**hello**</u>", "combined bold+underline"
+    assert _apply_formatting("", {"bold": True}) == "", "empty text formatting"
+    assert _apply_formatting("hello", {}) == "hello", "no formatting"
 
-    # option (c) routing: todos are NOT atomic; only url non-todos are clippings
+    # option (c) routing: todos/dash/number/bullet are NOT atomic; only url non-todos are clippings
     assert pick_atomic_kind({"type": "todo", "url": "https://example.com"}) is None, "todo not atomic"
+    assert pick_atomic_kind({"type": "dash", "url": "https://example.com"}) is None, "dash not atomic"
+    assert pick_atomic_kind({"type": "number", "url": "https://example.com"}) is None, "number not atomic"
+    assert pick_atomic_kind({"type": "bullet", "url": "https://example.com"}) is None, "bullet not atomic"
     assert pick_atomic_kind({"type": "note", "url": "https://example.com"}) == "clipping", "url->clipping"
-    assert pick_atomic_kind({"type": "note", "text": "hello"}) is None, "plain not atomic"
+    assert pick_atomic_kind({"type": "none", "text": "hello"}) is None, "plain not atomic"
+    assert pick_atomic_kind({"type": "none", "url": "https://example.com"}) == "clipping", "none+url->clipping"
 
-    # render_list_note renders todos as checkboxes + urls as links
+    # render_list_note renders todos as checkboxes + urls as links + formatting + notes
     list_things = [
         {"type": "todo", "completed": False, "text": "Read articles", "created": "2026-01-01T08:00:00Z", "tags": ["study"]},
         {"type": "todo", "completed": True, "text": "Send ticket", "created": "2026-01-02T08:00:00Z"},
         {"type": "note", "text": "Check this", "url": "https://obsidian.md", "created": "2026-01-03T08:00:00Z"},
         {"type": "note", "text": "Plain text", "created": "2026-01-04T08:00:00Z"},
+        {"type": "todo", "completed": False, "text": "Important task", "bold": True, "created": "2026-01-05T08:00:00Z"},
+        {"type": "todo", "completed": True, "text": "Canceled task", "canceled": True, "created": "2026-01-06T08:00:00Z"},
+        {"type": "note", "text": "With note", "note": "This is a long note", "created": "2026-01-07T08:00:00Z"},
     ]
     note = render_list_note("Project A", list_things, "2026-01-01T00:00:00Z", cfg)
     assert "- [ ] Read articles" in note, "list: open task"
@@ -780,6 +949,25 @@ def self_test():
     assert "[Check this](https://obsidian.md)" in note, "list: url link"
     assert "- Plain text" in note, "list: plain bullet"
     assert "[[Studies]]" in note, "list: category from tags"
+    assert "**Important task**" in note, "list: bold formatting"
+    assert "~~- [x] Canceled task~~" in note, "list: canceled strikethrough"
+    assert "> This is a long note" in note, "list: note field included"
+    
+    # Test favorited, photos, list_ref, clone info in list notes
+    lists_for_test = {"list1": {"title": "Main List"}, "ref1": {"title": "Ref List"}}
+    extended_things = [
+        {"type": "todo", "completed": False, "text": "Starred task", "favorited": True, "created": "2026-01-01T08:00:00Z"},
+        {"type": "note", "text": "With image", "photos": ["https://example.com/img.jpg"], "created": "2026-01-02T08:00:00Z"},
+        {"type": "note", "text": "With reference", "list_ref": "ref1", "created": "2026-01-03T08:00:00Z"},
+        {"type": "note", "text": "Cloned item", "clone_of": "orig123", "created": "2026-01-04T08:00:00Z"},
+        {"type": "note", "text": "Has clones", "has_clones": True, "created": "2026-01-05T08:00:00Z"},
+    ]
+    extended_note = render_list_note("Extended", extended_things, "2026-01-01T00:00:00Z", cfg, lists_for_test)
+    assert "⭐ Starred task" in extended_note, "list: favorited marker"
+    assert "![With image](https://example.com/img.jpg)" in extended_note, "list: photo included"
+    assert "[[Ref List]]" in extended_note, "list: list_ref wikilink"
+    assert "*Cloned from: orig123*" in extended_note, "list: clone_of info"
+    assert "*Has clones*" in extended_note, "list: has_clones info"
 
     print("Self-test PASSED.")
     return 0
