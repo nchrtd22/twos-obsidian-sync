@@ -32,7 +32,7 @@ from urllib import parse as urlparse
 from urllib import request as urlreq
 from urllib.error import HTTPError, URLError
 
-API_BASE = "https://writethingsdown.com/api/v1"
+API_BASE = "https://www.twosapp.com/api/v1"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "twos-sync"
 STATE_DIR = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser() / "twos-sync"
 ENV_PATH = CONFIG_DIR / ".env"
