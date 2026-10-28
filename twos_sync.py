@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib import parse as urlparse
@@ -600,6 +600,26 @@ def resolve_list(lid, lists, extra_lists, tw, unresolved_lists):
     return li
 
 
+def _now_iso():
+    """Current UTC time in the same format the Twos API uses for timestamps."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _next_cursor(things, prev=None):
+    """Next cursor: max updated (or created) across things, clamped to now.
+
+    Twos can stamp things with a future `updated` (e.g. a thing moved to a
+    future day). An unclamped cursor would leapfrog ahead of real time and
+    blind every subsequent delta run until real time catches up.
+    """
+    cur = max((t.get("updated") or t.get("created") or "") for t in things) if things else (prev or None)
+    now_iso = _now_iso()
+    if cur and cur > now_iso:
+        log(f"Cursor {cur} is in the future (future-dated thing); clamping to {now_iso}.", logging.WARNING)
+        cur = now_iso
+    return cur
+
+
 def run(args):
     vault = Path(args.vault).resolve() if args.vault else Path(__file__).resolve().parents[1]
     if not vault.exists():
@@ -635,6 +655,12 @@ def run(args):
             state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
             log(f"NOTE: could not parse {STATE_PATH}; starting fresh.")
+
+    # Sanitize a future-dated cursor on load so the fetch itself is unblinded
+    # (state saved from this run forward will carry the clamped value).
+    if state.get("cursor") and state["cursor"] > _now_iso():
+        log(f"NOTE: state cursor {state['cursor']} is in the future; clamping to {_now_iso()}.", logging.WARNING)
+        state["cursor"] = _now_iso()
 
     since = None if args.full else state.get("cursor")
     have_full = since is None and not args.list
@@ -780,7 +806,7 @@ def run(args):
     if args.list:
         new_cursor = state.get("cursor")
     else:
-        new_cursor = max((t.get("updated") or t.get("created") or "") for t in things) if things else state.get("cursor")
+        new_cursor = _next_cursor(things, state.get("cursor"))
 
     # ---- Report ----
     log(f"\nTwos sync {'(DRY-RUN)' if args.dry_run else '(APPLIED)'}")
@@ -952,6 +978,17 @@ def self_test():
         tmp_cfg.unlink(missing_ok=True)
     assert cfg_noyaml["default_cat"] == "[[Inbox]]" and "zzz" not in cfg_noyaml["cat_map"], \
         "load_config falls back to defaults when PyYAML missing"
+
+    # _next_cursor: max updated/created, clamped to now (Twos can stamp things
+    # with a future `updated`, which used to blind subsequent delta runs)
+    assert _next_cursor([], "2026-01-01T00:00:00.000Z") == "2026-01-01T00:00:00.000Z", "cursor: prev passthrough"
+    assert _next_cursor([{"updated": "2026-01-02T00:00:00.000Z"},
+                         {"created": "2026-01-03T00:00:00.000Z"}]) == "2026-01-03T00:00:00.000Z", \
+        "cursor: max updated/created"
+    clamped = _next_cursor([{"updated": "2099-01-01T00:00:00.000Z"}])
+    dt_clamped = parse_iso(clamped)
+    assert dt_clamped and abs((dt_clamped - datetime.now(timezone.utc)).total_seconds()) < 60, \
+        f"cursor clamped to now: {clamped}"
 
     # option (c) routing: todos/dash/number/bullet are NOT atomic; only url non-todos are clippings
     assert pick_atomic_kind({"type": "todo", "url": "https://example.com"}) is None, "todo not atomic"
