@@ -223,6 +223,7 @@ def load_config(config_path):
             log(f"NOTE: PyYAML missing and {config_path} present. "
                 f"Install with: pip install --user pyyaml  (or uv run --with pyyaml)")
             log("Falling back to built-in defaults.")
+            raw = DEFAULT_CFG
         else:
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     else:
@@ -528,7 +529,7 @@ def upsert_twos_section(content, section_body):
     after = "\n".join(lines[end:]).strip("\n")
     out = before + "\n\n" + section
     if after:
-        out += after + "\n"
+        out += "\n" + after + "\n"
     return out
 
 
@@ -869,6 +870,10 @@ def self_test():
     out2 = upsert_twos_section(out, "- 10:00 Bye\n")
     assert "- 09:00 Hello" not in out2 and "- 10:00 Bye" in out2, "replace"
     assert out2.count("## Twos") == 1, "single section"
+    # A following heading must be separated from the section body by a blank line
+    with_after = upsert_twos_section("# Day\n\n## Twos\n\n- 09:00 old\n\n## Journal\n\nText.\n",
+                                      "- 10:00 new\n")
+    assert "\n\n## Journal\n" in with_after and "- 10:00 new\n##" not in with_after, "blank line after section"
 
     # render_daily_section
     things = [
@@ -923,6 +928,30 @@ def self_test():
     assert _apply_formatting("hello", {"bold": True, "underline": True}) == "<u>**hello**</u>", "combined bold+underline"
     assert _apply_formatting("", {"bold": True}) == "", "empty text formatting"
     assert _apply_formatting("hello", {}) == "hello", "no formatting"
+
+    # load_config: missing config file -> built-in defaults
+    cfg_dflt = load_config(Path("/nonexistent/twos-import-map.yaml"))
+    assert cfg_dflt["default_cat"] == "[[Inbox]]" and cfg_dflt["cat_map"]["work"] == "[[Work]]", \
+        "load_config defaults"
+
+    # load_config: config file present but PyYAML missing -> must fall back to
+    # built-in defaults, NOT crash (regression: raw was never assigned)
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tf:
+        tf.write('categories:\n  zzz: "[[ZZZ]]"\n')
+        tmp_cfg = Path(tf.name)
+    yaml_mod = sys.modules.get("yaml")
+    sys.modules["yaml"] = None  # forces `import yaml` to raise ImportError
+    try:
+        cfg_noyaml = load_config(tmp_cfg)
+    finally:
+        if yaml_mod is None:
+            sys.modules.pop("yaml", None)
+        else:
+            sys.modules["yaml"] = yaml_mod
+        tmp_cfg.unlink(missing_ok=True)
+    assert cfg_noyaml["default_cat"] == "[[Inbox]]" and "zzz" not in cfg_noyaml["cat_map"], \
+        "load_config falls back to defaults when PyYAML missing"
 
     # option (c) routing: todos/dash/number/bullet are NOT atomic; only url non-todos are clippings
     assert pick_atomic_kind({"type": "todo", "url": "https://example.com"}) is None, "todo not atomic"
